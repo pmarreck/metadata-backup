@@ -1,4 +1,4 @@
-# metadata
+# metadata-backup
 
 A utility for backing up and restoring file metadata
 
@@ -38,7 +38,7 @@ metadata [OPTIONS] COMMAND [ARGS]
 ### Commands
 
 - `backup SOURCE [DEST]` - Create a metadata-only backup of SOURCE in DEST
-  - If DEST is omitted, uses SOURCE.metadata_%timestamp
+  - If DEST is omitted, uses `SOURCE.metadata_%timestamp`
 - `restore BACKUP DEST` - Restore metadata from BACKUP to DEST
 - `diff DIR1 DIR2` - Compare metadata between two directories
 - `test` - Run the test suite
@@ -46,12 +46,12 @@ metadata [OPTIONS] COMMAND [ARGS]
 ### Environment Variables
 
 - `TIMESTAMP` - Format string for %timestamp replacement (default: %Y%m%d%H%M%S)
-- `EXCLUDES` - Space-separated list of paths to exclude (default: "/tmp /proc /dev /sys .git node_modules __pycache__ .DS_Store")
-- `DEBUG` - Set to 1|t?(rue)|on|y?(es)|enable?(d) to enable debug output
+- `EXCLUDES` - Space-separated list of paths to exclude (default: `"/tmp /proc /dev /sys .git node_modules __pycache__ .DS_Store"`)
+- `DEBUG` - Set to `1|t?(rue)|on|y?(es)|enable?(d)` to enable debug output
 
 ### Default Exclusions
 
-The following paths are excluded by default (override with EXCLUDES env var):
+The following paths are excluded by default (override with `EXCLUDES` env var):
 ```
 /tmp
 /proc
@@ -66,43 +66,49 @@ __pycache__
 ### Timestamp Format
 
 The DEST path can include date format strings that will be replaced:
-- Use %timestamp to insert a timestamp (default: %Y%m%d%H%M%S)
-  - Override with TIMESTAMP env var
+- Use `%timestamp` to insert a timestamp (default: `%Y%m%d%H%M%S`)
+  - Override with `TIMESTAMP` env var
 - Use any date format string (see `man date`):
-  - %Y (year), %m (month), %d (day)
-  - %H (hour), %M (minute), %S (second)
+  - `%Y` (year), `%m` (month), `%d` (day)
+  - `%H` (hour), `%M` (minute), `%S` (second)
 
 ### Examples
 
 Create a metadata backup with default timestamp:
+
 ```bash
 metadata backup ~/documents
 # Creates: ~/documents.metadata_20250121094725
 ```
 
 Create a backup with custom timestamp format:
+
 ```bash
 TIMESTAMP=%Y-%m-%d metadata backup ~/documents
 # Creates: ~/documents.metadata_2025-01-21
 ```
 
 Use date format directly in path:
+
 ```bash
 metadata backup ~/documents ~/backups/%Y/%m/%d/docs.metadata
 # Creates: ~/backups/2025/01/21/docs.metadata
 ```
 
 Exclude specific directories:
+
 ```bash
 EXCLUDES="node_modules target .git" metadata backup ~/projects
 ```
 
 Restore metadata from backup:
+
 ```bash
 metadata restore ~/documents.metadata ~/documents.restored
 ```
 
 Compare metadata between directories:
+
 ```bash
 metadata diff ~/documents ~/documents.restored
 ```
@@ -116,11 +122,13 @@ metadata diff ~/documents ~/documents.restored
 ## Development
 
 The script includes a test suite that can be run with:
+
 ```bash
 metadata test
 ```
 
 Debug output can be enabled by setting the DEBUG environment variable:
+
 ```bash
 DEBUG=1 metadata test
 ```
