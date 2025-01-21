@@ -1,0 +1,779 @@
+#!/usr/bin/env bash
+
+# Enable strict mode
+set -euo pipefail
+# Enable error trapping, including in subshells
+set -E
+# Enable extended globbing
+shopt -s extglob
+
+# echo in yellow
+yellow() {
+	echo -e "\033[33m$1\033[0m"
+}
+
+# echo in green
+green() {
+	echo -e "\033[32m$1\033[0m"
+}
+
+# echo in red
+red() {
+	echo -e "\033[31m$1\033[0m"
+}
+
+# Check if debugging is enabled
+debugging() {
+	local debug_val="${DEBUG:-}"
+	case "${debug_val,,}" in  # ${var,,} converts to lowercase
+		1|t?(rue)|on|y?(es)|enable?(d))
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+# Print debug message if debugging
+debug() {
+	local msg="$1"
+	if debugging; then
+		yellow "DEBUG: $msg" >&2
+	fi
+}
+
+# Error output function
+error() {
+	red "ERROR: $*" >&2
+}
+
+# Note output function
+note() {
+	yellow "NOTE: $*" >&2
+}
+
+# Error handler with command substitution and subshell support
+err_report() {
+	# Disable error handling temporarily to prevent recursive traps
+	set +e
+	trap - ERR
+	
+	local line="$1"
+	local cmd="$2"
+	local code="${3:-1}"  # Default to 1 if no exit code provided
+	local func="${FUNCNAME[1]:-main}"  # Get calling function name, default to main
+	
+	# Log error details
+	debug "Error handler triggered with:"
+	debug "  Line number: $line"
+	debug "  Message: $cmd"
+	debug "  Exit code: $code"
+	debug "  Source: $0"
+	debug "  Function: $func"
+	
+	# Print error message and stack trace
+	error "Error in ${func}() at $0:$line; exit code: $code"
+	error "Command that failed: $cmd"
+	error "Call trace:"
+	local i=1
+	while caller $i >/dev/null 2>&1; do
+		local frame=($(caller $i))
+		local line_no=${frame[0]}
+		local func_name=${frame[1]}
+		local source_file=${frame[2]}
+		error " -> ${func_name}() at ${source_file}:${line_no}"
+		((i++)) || true
+	done
+	
+	# Re-enable error handling
+	set -e
+	trap 'err_report ${LINENO} "$BASH_COMMAND" $?' ERR
+	
+	return $code
+}
+
+# Set up error trap
+trap 'err_report ${LINENO} "$BASH_COMMAND" $?' ERR
+
+VERSION="0.1.0"
+
+# Default timestamp format if not specified in env
+: "${TIMESTAMP:=%Y%m%d%H%M%S}"
+
+# Default exclusions if not overridden
+: "${EXCLUDES:=/proc /dev /sys /private /Volumes tmp .git node_modules __pycache__ .DS_Store}"
+
+# Process path string, replacing timestamp placeholders with actual values
+process_path() {
+	local path="$1"
+	local timestamp
+	
+	# Replace %timestamp with formatted date
+	if [[ "$path" == *"%timestamp"* ]]; then
+		timestamp=$($DATE_CMD +"$TIMESTAMP")
+		path=${path//%timestamp/$timestamp}
+	fi
+	
+	# Replace any other date format strings
+	if [[ "$path" =~ %[YmdHMS] ]]; then
+		path=$($DATE_CMD +"$path")
+	fi
+	
+	echo "$path"
+}
+
+# Compare metadata between two files
+diff_file_metadata() {
+	local source="$1"
+	local target="$2"
+	local rel_path="$3"
+	local differences=0
+	
+	# Compare permissions
+	local source_perms=$($STAT_CMD --format=%a "$source")
+	local target_perms=$($STAT_CMD --format=%a "$target")
+	if [ "$source_perms" != "$target_perms" ]; then
+		echo "Permissions differ for $rel_path ($source_perms vs $target_perms)"
+		((differences++))
+	fi
+	
+	# Compare timestamps
+	local source_time=$($STAT_CMD --format=%Y "$source")
+	local target_time=$($STAT_CMD --format=%Y "$target")
+	if [ "$source_time" != "$target_time" ]; then
+		echo "Timestamps differ for $rel_path"
+		((differences++))
+	fi
+	
+	# Compare owner/group if running as root
+	if is_root; then
+		local source_owner=$($STAT_CMD --format="%u:%g" "$source")
+		local target_owner=$($STAT_CMD --format="%u:%g" "$target")
+		if [ "$source_owner" != "$target_owner" ]; then
+			echo "Owner/group differs for $rel_path ($source_owner vs $target_owner)"
+			((differences++))
+		fi
+	fi
+	
+	return "$differences"
+}
+
+# Compare metadata between two directories
+diff_metadata() {
+	local source_dir="$1"
+	local target_dir="$2"
+	local differences=0
+	
+	debug "Comparing metadata between $source_dir and $target_dir"
+	
+	# Get list of files from both directories, excluding .
+	local source_files=$(cd "$source_dir" && $FIND_CMD . -mindepth 1 \( -type f -o -type d \) | sort)
+	local target_files=$(cd "$target_dir" && $FIND_CMD . -mindepth 1 \( -type f -o -type d \) | sort)
+	
+	# Compare file lists
+	local all_files=$(echo "$source_files"$'\n'"$target_files" | sort -u)
+	
+	while IFS= read -r rel_path; do
+		[ -z "$rel_path" ] && continue
+		
+		local source_path="$source_dir/$rel_path"
+		local target_path="$target_dir/$rel_path"
+		
+		# Check if file exists in both directories
+		if [ ! -e "$source_path" ]; then
+			echo "File exists in only one directory: $rel_path"
+			((differences++))
+			continue
+		fi
+		if [ ! -e "$target_path" ]; then
+			echo "File exists in only one directory: $rel_path"
+			((differences++))
+			continue
+		fi
+		
+		# Compare metadata for matching files
+		diff_file_metadata "$source_path" "$target_path" "$rel_path"
+		((differences+=$?))
+	done <<< "$all_files"
+	
+	return $(( differences > 0 ))
+}
+
+# Copy metadata from source to target
+copy_metadata() {
+	local source="$1"
+	local target="$2"
+	
+	debug "Copying metadata from $source to $target"
+	
+	# Copy basic permissions
+	$CHMOD_CMD --reference="$source" "$target" || error "Failed to copy permissions for $target"
+	
+	# Copy ownership if root
+	if is_root; then
+		$CHOWN_CMD --reference="$source" "$target" || error "Failed to copy ownership for $target"
+	fi
+	
+	# Copy timestamps
+	$TOUCH_CMD --reference="$source" "$target" || error "Failed to copy timestamps for $target"
+}
+
+# Create metadata backup
+create_backup() {
+	local source_dir="$1"
+	local target_dir="$2"
+	local exclude_patterns=()
+	local excludes="${EXCLUDES:-/tmp /proc /dev /sys .git node_modules __pycache__ .DS_Store}"  # Use default if unset
+	
+	[ ! -d "$source_dir" ] && error "Source directory does not exist: $source_dir" && return 1
+	
+	# Process target directory for timestamp placeholders
+	target_dir=$(process_path "$target_dir")
+	
+	if ! is_root; then
+		echo "Warning: Not running as root - ownership (user/group) metadata will not be backed up"
+	fi
+	
+	debug "Creating backup from $source_dir to $target_dir"
+	
+	# Build exclude patterns from space-separated EXCLUDES
+	debug "Building exclude patterns from: $excludes"
+	for excl in $excludes; do
+		# Handle paths starting with ./ from find and regular files
+		debug "Processing exclude pattern: '$excl'"
+		exclude_patterns+=(
+			-not -path "*$excl*"
+			-not -name "$excl"
+		)
+	done
+	
+	# Debug: show final find command
+	debug "Find command: $FIND_CMD . ${exclude_patterns[*]}"
+	
+	# Create target directory if it doesn't exist
+	local parent_dir=$(dirname "$target_dir")
+	if [ ! -w "$parent_dir" ]; then
+		error "No write permission to parent directory: $parent_dir"
+		note "Try running with sudo or changing permissions of $parent_dir"
+		return 1
+	fi
+	
+	if ! mkdir -p "$target_dir" 2>/dev/null; then
+		local err=$?
+		case $err in
+			13) # Permission denied
+				error "Permission denied creating directory: $target_dir"
+				note "Try running with sudo or changing permissions"
+				;;
+			28) # No space left on device
+				error "No space left on device while creating: $target_dir"
+				note "Free up some disk space and try again"
+				;;
+			*)
+				error "Failed to create target directory ($err): $target_dir"
+				;;
+		esac
+		return 1
+	fi
+	
+	# Process all files and directories in a single pass, in depth-first order
+	debug "Processing files and directories..."
+	(cd "$source_dir" && $FIND_CMD . "${exclude_patterns[@]}" -depth -print0) | while IFS= read -r -d '' item; do
+		[ "$item" = "." ] && continue  # Skip source dir itself
+		
+		# Strip leading ./ from item if present
+		item="${item#./}"
+		
+		target_path="$target_dir/$item"
+		source_path="$source_dir/$item"
+		
+		if [ -d "$source_path" ]; then
+			debug "Creating directory: $item"
+			mkdir -p "$target_path"
+			copy_metadata "$source_path" "$target_path"
+		else
+			debug "Creating empty file: $item"
+			mkdir -p "$(dirname "$target_path")"  # Ensure parent directory exists
+			$TOUCH_CMD "$target_path"
+			copy_metadata "$source_path" "$target_path"
+		fi
+	done
+	
+	debug "Metadata backup created at: $target_dir"
+	return 0
+}
+
+# Restore metadata from backup
+restore_metadata() {
+	local backup_dir="$1"
+	local target_dir="$2"
+	
+	[ ! -d "$backup_dir" ] && error "Backup directory does not exist: $backup_dir" && return 1
+	[ ! -d "$target_dir" ] && error "Target directory does not exist: $target_dir" && return 1
+	
+	if ! is_root; then
+		echo "Warning: Not running as root - ownership (user/group) metadata will not be restored"
+	fi
+	
+	debug "Restoring metadata to: $target_dir"
+	
+	# Process each file in the backup, using -mindepth 1 to skip the backup dir itself
+	$FIND_CMD "$backup_dir" -mindepth 1 -print0 | while IFS= read -r -d '' backup_item; do
+		rel_path="${backup_item#$backup_dir/}"  # Remove backup_dir prefix
+		target_item="$target_dir/$rel_path"
+		
+		if [ ! -e "$target_item" ]; then
+			if [ -d "$backup_item" ]; then
+				echo "Skipping metadata restore for missing directory: $rel_path" >&2
+			else
+				echo "Skipping metadata restore for missing file: $rel_path" >&2
+			fi
+			continue
+		fi
+		
+		# Copy metadata only if target exists
+		$CHMOD_CMD --reference="$backup_item" "$target_item" || error "Failed to copy permissions for $rel_path"
+		$TOUCH_CMD -r "$backup_item" "$target_item" || error "Failed to copy timestamps for $rel_path"
+		
+		if is_root; then
+			$CHOWN_CMD --reference="$backup_item" "$target_item" || error "Failed to copy ownership for $rel_path"
+		fi
+	done
+	
+	debug "Metadata restored to: $target_dir"
+}
+
+# Print usage message and exit
+usage() {
+	local error_msg="$1"
+	if [ -n "$error_msg" ]; then
+		error "$error_msg"
+	fi
+	echo "Usage: $(basename "$0") [OPTIONS] COMMAND [ARGS]"
+	echo "Try '$(basename "$0") --help' for more information."
+	exit 1
+}
+
+# Ensure GNU utilities are available and set up command aliases
+setup_commands() {
+	local gnu_prefix=""
+	
+	# Check if we're on macOS and need to use gcommands
+	if [[ "$(uname)" == "Darwin" ]]; then
+		gnu_prefix="g"
+	fi
+	
+	# Set up command aliases - some commands don't need gnu prefix
+	export STAT_CMD="${gnu_prefix}stat"
+	export TOUCH_CMD="${gnu_prefix}touch"
+	export FIND_CMD="find"  # BSD find is compatible enough
+	export DATE_CMD="${gnu_prefix}date"
+	export AWK_CMD="${gnu_prefix}awk"
+	export SED_CMD="sed"    # BSD sed is compatible enough
+	export CHMOD_CMD="${gnu_prefix}chmod"  # Need GNU version for --reference
+	export CHOWN_CMD="${gnu_prefix}chown"  # Need GNU version for --reference
+	
+	# Verify commands exist
+	local required_cmds=("$STAT_CMD" "$TOUCH_CMD" "$FIND_CMD" "$DATE_CMD" "$AWK_CMD" "$SED_CMD" "$CHMOD_CMD" "$CHOWN_CMD")
+	local missing_cmds=()
+	
+	for cmd in "${required_cmds[@]}"; do
+		if ! command -v "$cmd" &> /dev/null; then
+			missing_cmds+=("$cmd")
+		else
+			declare "$cmd"="$(command -v "$cmd")"
+		fi
+	done
+	
+	if [ ${#missing_cmds[@]} -ne 0 ]; then
+		echo "Error: Required GNU utilities not found: ${missing_cmds[*]}"
+		echo "Please install GNU coreutils (brew install coreutils)"
+		exit 1
+	fi
+}
+
+# Run individual tests and capture their return values without exiting on failure
+run_tests() {
+	local test_fails=0
+	local ret=0
+	
+	if ! is_root; then
+		note "Running without root privileges - skipping special permission tests"
+	fi
+	
+	# Test utilities
+	export TEST_DIR=$(mktemp -d)
+	export BACKUP_DIR=$(mktemp -d)
+	export RESTORE_DIR=$(mktemp -d)
+	
+	# Create test files and directories with various metadata
+	mkdir -p "$TEST_DIR/dir1/subdir1/subdir2"
+	$TOUCH_CMD "$TEST_DIR/dir1/file1"
+	$TOUCH_CMD "$TEST_DIR/dir1/file2"
+	$TOUCH_CMD "$TEST_DIR/dir1/subdir1/subdir2/file3"
+	
+	# Set up test permissions and timestamps
+	$CHMOD_CMD 600 "$TEST_DIR/dir1/file1"
+	$CHMOD_CMD 755 "$TEST_DIR/dir1/file2"
+	$CHMOD_CMD 644 "$TEST_DIR/dir1/subdir1/subdir2/file3"
+	$TOUCH_CMD -t 202001010000 "$TEST_DIR/dir1/file1"
+	$TOUCH_CMD -t 202002020000 "$TEST_DIR/dir1/file2"
+	$TOUCH_CMD -t 202003030000 "$TEST_DIR/dir1/subdir1/subdir2/file3"
+	
+	(
+		test_create_backup || ret=$?
+		((test_fails+=ret)) || true
+		
+		test_restore_metadata || ret=$?
+		((test_fails+=ret)) || true
+		
+		test_diff_metadata || ret=$?
+		((test_fails+=ret)) || true
+		
+		test_excludes || ret=$?
+		((test_fails+=ret)) || true
+		
+		test_error_handler || ret=$?
+		((test_fails+=ret)) || true
+		
+		if [ $test_fails -eq 0 ]; then
+			green "All tests passed!"
+		else
+			red "$test_fails tests failed!"
+		fi
+		return $test_fails
+	) 2>&1 | grep -v "Not running as root"
+	
+	local test_status=${PIPESTATUS[0]}
+	
+	# Clean up
+	rm -rf "$TEST_DIR" "$BACKUP_DIR" "$RESTORE_DIR"
+	unset TEST_DIR BACKUP_DIR RESTORE_DIR
+	
+	return $test_status
+}
+
+test_create_backup() {
+	debug "Testing backup creation..."
+	
+	# Create backup
+	create_backup "$TEST_DIR" "$BACKUP_DIR"
+	
+	# Verify backup structure
+	local failures=0
+	
+	# Check if files exist
+	for file in "dir1/file1" "dir1/file2" "dir1/subdir1/subdir2/file3"; do
+		if [ ! -e "$BACKUP_DIR/$file" ]; then
+			error "$(basename "$file") not created in backup"
+			((failures++)) || true
+		fi
+	done
+	
+	# Check permissions
+	[ "$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/file1")" = "600" ] || { error "'600' != '$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/file1")'"; ((failures++)) || true; }
+	[ "$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/file2")" = "755" ] || { error "'755' != '$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/file2")'"; ((failures++)) || true; }
+	[ "$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/subdir1/subdir2/file3")" = "644" ] || { error "'644' != '$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/subdir1/subdir2/file3")'"; ((failures++)) || true; }
+	
+	if [ "$failures" -eq 0 ]; then
+		debug "Backup creation test passed"
+	else
+		error "Backup creation test failed with $failures errors"
+	fi
+	return $failures
+}
+
+test_restore_metadata() {
+	debug "Testing metadata restoration..."
+	local ret=0
+	
+	# Create backup
+	create_backup "$TEST_DIR" "$BACKUP_DIR"
+	
+	# Create target directory with same structure but different metadata
+	mkdir -p "$RESTORE_DIR/dir1/subdir1/subdir2"
+	$TOUCH_CMD "$RESTORE_DIR/dir1/file1"
+	$TOUCH_CMD "$RESTORE_DIR/dir1/file2"
+	$TOUCH_CMD "$RESTORE_DIR/dir1/subdir1/subdir2/file3"
+	$CHMOD_CMD 777 "$RESTORE_DIR/dir1/file1"  # Different from original 600
+	$CHMOD_CMD 644 "$RESTORE_DIR/dir1/file2"  # Different from original 755
+	
+	# Restore metadata
+	restore_metadata "$BACKUP_DIR" "$RESTORE_DIR"
+	
+	# Compare metadata
+	diff_metadata "$TEST_DIR" "$RESTORE_DIR" || ret=$?
+	
+	if [ $ret -eq 0 ]; then
+		debug "Restore test passed"
+	else
+		error "Restore test failed"
+	fi
+	return $ret
+}
+
+test_diff_metadata() {
+	debug "Testing metadata diff..."
+	local failures=0
+	local ret=0
+	
+	# First test: identical directories should report no differences
+	create_backup "$TEST_DIR" "$BACKUP_DIR" || { error "Failed to create backup for test setup in test_diff_metadata"; ((ret++)) || true; }
+	diff_metadata "$TEST_DIR" "$BACKUP_DIR" || ret=$?
+	if [ $ret -ne 0 ]; then
+		error "Initial diff reported differences when there should be none"
+		((failures++)) || true
+	fi
+	
+	# Second test: different permissions should be detected
+	$CHMOD_CMD 777 "$BACKUP_DIR/dir1/file1"
+	diff_metadata "$TEST_DIR" "$BACKUP_DIR" > /dev/null || ret=$?
+	if [ $ret -eq 0 ]; then
+		error "Diff did not detect permission changes"
+		((failures++)) || true
+	fi
+	
+	if [ "$failures" -eq 0 ]; then
+		debug "Diff test passed"
+	else
+		error "Diff test failed with $failures errors"
+	fi
+	return $failures
+}
+
+test_excludes() {
+	local failures=0
+	debug "Testing exclusion functionality..."
+	
+	# Create test structure with excludable content
+	mkdir -p "$TEST_DIR"/{src,node_modules,target}
+	$TOUCH_CMD "$TEST_DIR"/{src/main.rs,node_modules/foo,target/debug}
+	
+	# Test with custom excludes
+	EXCLUDES="target node_modules" create_backup "$TEST_DIR" "$BACKUP_DIR"
+	
+	# Verify only src dir was backed up
+	if [ -e "$BACKUP_DIR/node_modules" ]; then
+		error "node_modules was not excluded"
+		((failures++)) || true
+	fi
+	
+	if [ -e "$BACKUP_DIR/target" ]; then
+		error "target was not excluded"
+		((failures++)) || true
+	fi
+	
+	if [ ! -e "$BACKUP_DIR/src/main.rs" ]; then
+		error "src/main.rs was incorrectly excluded"
+		((failures++)) || true
+	fi
+	
+	# Test with default excludes
+	rm -rf "$BACKUP_DIR"
+	mkdir -p "$TEST_DIR"/.git
+	$TOUCH_CMD "$TEST_DIR"/.git/config
+	unset EXCLUDES  # Ensure we use defaults
+	create_backup "$TEST_DIR" "$BACKUP_DIR"
+	
+	if [ -e "$BACKUP_DIR/.git" ]; then
+		error "Default exclude (.git) was not honored"
+		((failures++)) || true
+	fi
+	
+	if [ "$failures" -eq 0 ]; then
+		debug "Exclusion test passed"
+	else
+		error "Exclusion test failed with $failures errors"
+	fi
+	return $failures
+}
+
+test_error_handler() {
+	debug "Testing error handler..."
+	
+	# Create a temp file for error output
+	local error_output=$(mktemp)
+	
+	# Run this script with a command we know will fail
+	# We use process substitution to capture stderr while allowing stdout through
+	if DEBUG=1 $0 error_test 2> "$error_output"; then
+		error "Error handler test failed - command succeeded when it should have failed"
+		rm "$error_output"
+		return 1
+	fi
+	
+	# Check that error output contains expected elements
+	local expected_patterns=(
+		"Error in.*at.*metadata.*exit code:"
+		"Command that failed:"
+		"Call trace:"
+		"[[:space:]]*->.*at.*metadata:"
+	)
+	
+	local failed=0
+	for pattern in "${expected_patterns[@]}"; do
+		if ! grep -E "$pattern" "$error_output" >/dev/null; then
+			error "Error handler test failed - missing expected pattern: $pattern"
+			error "Error output was:"
+			cat "$error_output" >&2
+			failed=1
+		fi
+	done
+	
+	rm "$error_output"
+	
+	if [ "$failed" -eq 0 ]; then
+		debug "Error handler test passed"
+	fi
+	
+	return $failed
+}
+
+# Special command just for testing the error handler
+error_test() {
+	# This will definitely fail and trigger the handler
+	ls nonexistent_directory_that_should_not_exist_anywhere_really_seriously
+	# The line above should fail before we get here
+	error "Error handler test failed - command succeeded when it should have failed"
+	return 1
+}
+
+# Print help message
+show_help() {
+	cat << EOF
+$(basename "$0") v$VERSION - A utility for backing up and restoring file metadata
+
+DESCRIPTION
+	This script creates metadata-only backups of files and directories, preserving:
+	- Permissions (including special bits like setuid, setgid, sticky)
+	- Ownership (user and group)
+	- Timestamps
+	- Directory structure
+	
+	The backup contains empty files with the same metadata as the originals,
+	making it space-efficient for metadata recovery scenarios.
+
+BACKGROUND
+	This tool was born from a painful experience where a recursive chmod/chown 
+	command gone wrong rendered a system unbootable. The only recourse at the 
+	time was restoring an entire backup just to fix metadata - a wasteful 
+	solution to what should have been a simple problem. This tool aims to 
+	prevent such headaches by providing a way to backup, diff and restore
+	just file/directory metadata to a mirrored file hierarchy of empty files.
+
+USAGE
+	$(basename "$0") [OPTIONS] COMMAND [ARGS]
+
+OPTIONS
+	-h, --help     Show this help message and exit
+	-v, --version  Show version information and exit
+
+COMMANDS
+	backup SOURCE [DEST]  Create a metadata-only backup of SOURCE in DEST
+						 If DEST is omitted, uses SOURCE.metadata_%timestamp
+	restore BACKUP DEST   Restore metadata from BACKUP to DEST
+	diff DIR1 DIR2       Compare metadata between two directories
+	test                 Run the test suite
+
+ENVIRONMENT
+	TIMESTAMP   Format string for %timestamp replacement (default: %Y%m%d%H%M%S)
+	EXCLUDES    Space-separated list of paths to exclude (default: /tmp /proc /dev
+	              /sys .git node_modules __pycache__ .DS_Store)
+	DEBUG       Set to 1 to enable debug output
+
+TIMESTAMP FORMAT
+	The DEST path can include date format strings that will be replaced:
+	- Use %timestamp to insert a timestamp (default: %Y%m%d%H%M%S)
+	  Override with TIMESTAMP env var
+	- Use any date format string (see 'man date'):
+	  %Y (year), %m (month), %d (day), %H (hour), %M (minute), %S (second)
+
+EXAMPLES
+	# Create a metadata backup with default timestamp
+	$(basename "$0") backup ~/documents
+	# Creates: ~/documents.metadata_20250121094725
+
+	# Create a backup with custom timestamp format
+	TIMESTAMP=%Y-%m-%d $(basename "$0") backup ~/documents
+	# Creates: ~/documents.metadata_2025-01-21
+
+	# Use date format directly in path
+	$(basename "$0") backup ~/documents ~/backups/%Y/%m/%d/docs.metadata
+	# Creates: ~/backups/2025/01/21/docs.metadata
+
+	# Exclude specific directories
+	EXCLUDES="node_modules target .git" $(basename "$0") backup ~/projects
+
+	# Restore metadata from backup
+	$(basename "$0") restore ~/documents.metadata ~/documents.restored
+
+	# Compare metadata between directories
+	$(basename "$0") diff ~/documents ~/documents.restored
+
+NOTES
+	- Running with root privileges is required to preserve special permissions.
+	  (If you're not running as root, the script will skip special permission
+	  tests.)
+	- The script uses GNU versions of core utilities (gstat, gfind, etc.)
+	- While designed to work on both macOS and Linux, current testing has
+	  only been performed on macOS. Linux support is expected, but not yet
+	  verified.
+	- Some paths are excluded by default: /tmp, /proc, /dev, /sys, .git,
+	  node_modules, __pycache__, .DS_Store
+EOF
+}
+
+# Check if running as root
+is_root() {
+	[ "$(id -u)" -eq 0 ]
+}
+
+# Main function
+main() {
+	local command="${1:-none}"
+	shift || true
+	
+	setup_commands
+	
+	case "$command" in
+		backup)
+			[ $# -lt 1 ] && { usage "backup requires at least a source directory"; exit 1; }
+			[ $# -gt 2 ] && { usage "too many arguments for backup command"; exit 1; }
+			local source_dir="$1"
+			# If no target dir specified, use default with timestamp
+			local target_dir="${2:-${source_dir%/}.metadata_$(date +"$TIMESTAMP")}"
+			create_backup "$source_dir" "$target_dir" || exit $?
+			;;
+		restore)
+			[ $# -eq 2 ] || { usage "restore requires backup and target directories"; exit 1; }
+			restore_metadata "$1" "$2" || exit $?
+			;;
+		diff)
+			[ $# -eq 2 ] || { usage "diff requires two directories to compare"; exit 1; }
+			diff_metadata "$1" "$2" || exit $?
+			;;
+		test)
+			run_tests || exit $?
+			;;
+		error_test)
+			# Special case for testing error handler
+			ls nonexistent_directory_that_should_not_exist_anywhere_really_seriously
+			;;
+		--help|-h)
+			show_help
+			;;
+		-v|--version)
+			echo "metadata version $VERSION"
+			;;
+		*)
+			usage "Unknown command: $command"
+			exit 1
+			;;
+	esac
+}
+
+# Only run main if script is executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	main "$@"
+fi
