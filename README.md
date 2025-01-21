@@ -16,6 +16,10 @@ This script creates metadata-only backups of files and directories, preserving:
 
 The backup contains empty files with the same metadata as the originals, making it space-efficient for metadata recovery scenarios.
 
+### Symlinks
+
+Symbolic links are intentionally ignored during backup and restore operations. This is because symlink metadata is not meaningful for backup purposes - the permissions and ownership of a symlink are ignored by the system in favor of the target file's metadata. When restoring metadata, we focus on the actual target files rather than the symlinks pointing to them.
+
 ## Installation
 
 1. Ensure you have the GNU core utilities installed:
@@ -131,4 +135,3 @@ Debug output can be enabled by setting the DEBUG environment variable:
 
 ```bash
 DEBUG=1 metadata test
-```
