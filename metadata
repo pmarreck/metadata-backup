@@ -279,8 +279,30 @@ create_backup() {
 
 	# Process all files and directories in a single pass, in depth-first order
 	debug "Processing files and directories..."
+	local update_interval="${UPDATE_INTERVAL:-100}"  # Show progress every N files
+
+	# First pass to count total files (fast because we don't create anything)
+	local total_items=$(cd "$source_dir" && $FIND_CMD . "${exclude_patterns[@]}" -not -type l -depth -print0 | tr -dc '\0' | wc -c)
+	debug "Total items to process: $total_items"
+
+	# Create temp file for progress tracking
+	local progress_file=$(mktemp)
+	echo "0" > "$progress_file"
+
+	# Process files and update progress inline
 	(cd "$source_dir" && $FIND_CMD . "${exclude_patterns[@]}" -not -type l -depth -print0) | while IFS= read -r -d '' item; do
 		[ "$item" = "." ] && continue  # Skip source dir itself
+		count=$(<"$progress_file")
+		((count++))
+		echo "$count" > "$progress_file"
+
+		# Calculate percentage
+		local percent=$((count * 100 / total_items))
+
+		# Show progress at key percentages or interval
+		if ((percent == 50)) || ((percent == 100)) || ((count % update_interval == 0)); then
+			printf "\rProgress: %d%% (%d/%d)\n" "$percent" "$count" "$total_items" >&2
+		fi
 
 		# Strip leading ./ from item if present
 		item="${item#./}"
@@ -299,6 +321,11 @@ create_backup() {
 			copy_metadata "$source_path" "$target_path"
 		fi
 	done
+
+	# Show final progress
+	count=$(<"$progress_file")
+	printf "\rProgress: 100%% (%d/%d)\n" "$total_items" "$total_items" >&2
+	rm -f "$progress_file"
 
 	debug "Metadata backup created at: $target_dir"
 	return 0
@@ -444,6 +471,9 @@ run_tests() {
 		((test_fails+=ret)) || true
 
 		test_error_handler || ret=$?
+		((test_fails+=ret)) || true
+
+		test_progress_indication || ret=$?
 		((test_fails+=ret)) || true
 
 		if [ $test_fails -eq 0 ]; then
@@ -650,6 +680,46 @@ test_error_handler() {
 	return $failed
 }
 
+test_progress_indication() {
+	debug "Testing progress indication..."
+	local failures=0
+	local progress_output=$(mktemp)
+
+	# Create exactly two test files
+	mkdir -p "$TEST_DIR/progress_test"
+	$TOUCH_CMD "$TEST_DIR/progress_test/file1"
+	$TOUCH_CMD "$TEST_DIR/progress_test/file2"
+
+	# Capture stderr while running backup with UPDATE_INTERVAL=1
+	UPDATE_INTERVAL=1 create_backup "$TEST_DIR/progress_test" "$BACKUP_DIR" 2> "$progress_output"
+
+	# Check for 33% progress message after first file
+	if ! grep -q "Progress: 33% (1/3)" "$progress_output"; then
+		error "Expected 33% progress message not found"
+		error "Actual output:"
+		cat "$progress_output" >&2
+		((failures++))
+	fi
+
+	# Check for 100% progress message at end
+	if ! grep -q "Progress: 100% (3/3)" "$progress_output"; then
+		error "Expected 100% progress message not found"
+		error "Actual output:"
+		cat "$progress_output" >&2
+		((failures++))
+	fi
+
+	rm -f "$progress_output"
+
+	if [ "$failures" -eq 0 ]; then
+		debug "Progress indication test passed"
+	else
+		error "Progress indication test failed with $failures errors"
+	fi
+
+	return $failures
+}
+
 # Special command just for testing the error handler
 error_test() {
 	# This will definitely fail and trigger the handler
@@ -704,6 +774,7 @@ ENVIRONMENT
 	EXCLUDES    Space-separated list of paths to exclude (default: /tmp /proc /dev
 	              /sys .git node_modules __pycache__ .DS_Store)
 	DEBUG       Set to 1 to enable debug output
+	UPDATE_INTERVAL  Number of files to process before showing progress (default: 100)
 
 TIMESTAMP FORMAT
 	The DEST path can include date format strings that will be replaced:
