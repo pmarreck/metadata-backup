@@ -49,6 +49,9 @@ metadata_run_tests() {
 		test_cli_validation || ret=$?
 		((test_fails+=ret)) || true
 
+		test_cli_flags || ret=$?
+		((test_fails+=ret)) || true
+
 		test_process_path || ret=$?
 		((test_fails+=ret)) || true
 
@@ -267,6 +270,27 @@ test_cli_validation() {
 	fi
 
 	set -e
+	return $failures
+}
+
+test_cli_flags() {
+	debug "Testing CLI convenience flags..."
+	local failures=0
+
+	# about flag should succeed and be non-empty
+	local about
+	about=$("$0" --about 2>/dev/null)
+	if [ $? -ne 0 ] || [ -z "$about" ]; then
+		error "--about failed or returned empty output"
+		((failures++))
+	fi
+
+	# help flag should succeed
+	if ! "$0" --help >/dev/null 2>&1; then
+		error "--help failed"
+		((failures++))
+	fi
+
 	return $failures
 }
 
