@@ -99,7 +99,11 @@ trap 'err_report ${LINENO} "$BASH_COMMAND" $?' ERR
 VERSION="0.1.0"
 
 # Central default exclusions (kept in one place to avoid drift)
-DEFAULT_EXCLUDES="/tmp /proc /dev /sys /private /Volumes .git node_modules __pycache__ .DS_Store"
+DEFAULT_EXCLUDES="/tmp /proc /dev /sys /private .git node_modules __pycache__ .DS_Store"
+
+# Failure logging
+FAIL_LOG=""
+FAIL_COUNT=0
 
 # Default timestamp format if not specified in env
 : "${TIMESTAMP:=%Y%m%d%H%M%S}"
@@ -207,19 +211,31 @@ diff_metadata() {
 copy_metadata() {
 	local source="$1"
 	local target="$2"
+	local cmd
 
 	debug "Copying metadata from $source to $target"
 
 	# Copy basic permissions
-	$CHMOD_CMD --reference="$source" "$target" || { error "Failed to copy permissions for $target"; return 1; }
+	cmd="$CHMOD_CMD --reference=\"$source\" \"$target\""
+	if ! $CHMOD_CMD --reference="$source" "$target"; then
+		record_failure "$cmd" "copy permissions"
+	fi
 
 	# Copy ownership if root
 	if is_root; then
-		$CHOWN_CMD --reference="$source" "$target" || { error "Failed to copy ownership for $target"; return 1; }
+		cmd="$CHOWN_CMD --reference=\"$source\" \"$target\""
+		if ! $CHOWN_CMD --reference="$source" "$target"; then
+			record_failure "$cmd" "copy ownership"
+		fi
 	fi
 
 	# Copy timestamps
-	$TOUCH_CMD --reference="$source" "$target" || { error "Failed to copy timestamps for $target"; return 1; }
+	cmd="$TOUCH_CMD --reference=\"$source\" \"$target\""
+	if ! $TOUCH_CMD --reference="$source" "$target"; then
+		record_failure "$cmd" "copy timestamps"
+	fi
+
+	return 0
 }
 
 # Create metadata backup
@@ -324,18 +340,23 @@ backup_metadata() {
 		if [ -d "$source_path" ]; then
 			debug "Creating directory: $item"
 			mkdir -p "$target_path"
-			copy_metadata "$source_path" "$target_path" || return 1
+			copy_metadata "$source_path" "$target_path"
 		else
 			debug "Creating empty file: $item"
 			mkdir -p "$(dirname "$target_path")"  # Ensure parent directory exists
 			$TOUCH_CMD "$target_path"
-			copy_metadata "$source_path" "$target_path" || return 1
+			copy_metadata "$source_path" "$target_path"
 		fi
 	done
 
 	# Show final progress
 	if [[ -z "${MUTE_PROGRESS:-}" ]]; then
 		printf "\rProgress: 100%% (%d/%d)\n" "$total_items" "$total_items" >&2
+	fi
+
+	if [ $FAIL_COUNT -gt 0 ]; then
+		note "Metadata backup completed with $FAIL_COUNT failures. See $FAIL_LOG for rerunnable commands."
+		return 1
 	fi
 
 	debug "Metadata backup created at: $target_dir"
@@ -371,13 +392,21 @@ restore_metadata() {
 		fi
 
 		# Copy metadata only if target exists
-		$CHMOD_CMD --reference="$backup_item" "$target_item" || error "Failed to copy permissions for $rel_path"
-		$TOUCH_CMD -r "$backup_item" "$target_item" || error "Failed to copy timestamps for $rel_path"
+		cmd="$CHMOD_CMD --reference=\"$backup_item\" \"$target_item\""
+		$CHMOD_CMD --reference="$backup_item" "$target_item" || record_failure "$cmd" "copy permissions for $rel_path"
+		cmd="$TOUCH_CMD -r \"$backup_item\" \"$target_item\""
+		$TOUCH_CMD -r "$backup_item" "$target_item" || record_failure "$cmd" "copy timestamps for $rel_path"
 
 		if is_root; then
-			$CHOWN_CMD --reference="$backup_item" "$target_item" || error "Failed to copy ownership for $rel_path"
+			cmd="$CHOWN_CMD --reference=\"$backup_item\" \"$target_item\""
+			$CHOWN_CMD --reference="$backup_item" "$target_item" || record_failure "$cmd" "copy ownership for $rel_path"
 		fi
 	done
+
+	if [ $FAIL_COUNT -gt 0 ]; then
+		note "Metadata restore completed with $FAIL_COUNT failures. See $FAIL_LOG for rerunnable commands."
+		return 1
+	fi
 
 	debug "Metadata restored to: $target_dir"
 }
@@ -429,6 +458,21 @@ setup_commands() {
 		echo "Please install GNU coreutils (brew install coreutils)"
 		exit 1
 	fi
+}
+
+# Record a failed metadata operation and keep a rerunnable log
+record_failure() {
+	local command_str="$1"
+	local reason="$2"
+
+	((FAIL_COUNT++)) || true
+
+	if [ -z "$FAIL_LOG" ]; then
+		FAIL_LOG=$(mktemp /tmp/metadata_failures.XXXXXX)
+	fi
+
+	printf '%s\n' "$command_str  # $reason" >> "$FAIL_LOG"
+	red "Failed: $reason (${FAIL_COUNT} so far)"
 }
 
 # Locate and execute the external test suite

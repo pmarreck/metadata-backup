@@ -50,7 +50,7 @@ metadata [OPTIONS] COMMAND [ARGS]
 ### Environment Variables
 
 - `TIMESTAMP` - Format string for %timestamp replacement (default: %Y%m%d%H%M%S)
-- `EXCLUDES` - Space-separated list of paths to exclude (default: `"/tmp /proc /dev /sys /private /Volumes .git node_modules __pycache__ .DS_Store"`)
+- `EXCLUDES` - Space-separated list of paths to exclude (default: `"/tmp /proc /dev /sys /private .git node_modules __pycache__ .DS_Store"`)
 - `DEBUG` - Set to `1|t?(rue)|on|y?(es)|enable?(d)` to enable debug output
 
 ### Default Exclusions
@@ -62,7 +62,6 @@ The following paths are excluded by default (override with `EXCLUDES` env var):
 /dev
 /sys
 /private
-/Volumes
 .git
 node_modules
 __pycache__

@@ -294,8 +294,15 @@ test_copy_metadata_failure() {
 	local target="$TEST_DIR/target"
 
 	touch "$target"
-	if copy_metadata "$missing_source" "$target" 2>/dev/null; then
-		error "copy_metadata succeeded despite missing source"
+	FAIL_COUNT=0
+	FAIL_LOG=""
+	copy_metadata "$missing_source" "$target" 2>/dev/null || true
+	if [ $FAIL_COUNT -eq 0 ]; then
+		error "copy_metadata did not record failure for missing source"
+		((failures++))
+	fi
+	if [ -z "$FAIL_LOG" ] || [ ! -s "$FAIL_LOG" ]; then
+		error "Failure log not created or empty"
 		((failures++))
 	fi
 
