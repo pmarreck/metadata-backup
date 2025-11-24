@@ -472,7 +472,9 @@ record_failure() {
 	fi
 
 	printf '%s\n' "$command_str  # $reason" >> "$FAIL_LOG"
-	red "Failed: $reason (${FAIL_COUNT} so far)"
+	if [[ -z "${QUIET_FAILURES:-}" ]]; then
+		red "Failed: $reason (${FAIL_COUNT} so far)"
+	fi
 }
 
 # Locate and execute the external test suite

@@ -316,11 +316,17 @@ test_copy_metadata_failure() {
 	local failures=0
 	local missing_source="$TEST_DIR/nonexistent"
 	local target="$TEST_DIR/target"
+	local errbuf=""
+	local saved_red
+	saved_red=$(declare -f red)
+
+	# Capture red() output in-memory to keep test output clean
+	red() { errbuf+="$*"$'\n'; }
 
 	touch "$target"
 	FAIL_COUNT=0
 	FAIL_LOG=""
-	copy_metadata "$missing_source" "$target" 2>/dev/null || true
+	copy_metadata "$missing_source" "$target" >/dev/null 2>&1 || true
 	if [ $FAIL_COUNT -eq 0 ]; then
 		error "copy_metadata did not record failure for missing source"
 		((failures++))
@@ -329,6 +335,13 @@ test_copy_metadata_failure() {
 		error "Failure log not created or empty"
 		((failures++))
 	fi
+	if ! printf '%s' "$errbuf" | grep -q "Failed: copy permissions"; then
+		error "stderr did not include failure message"
+		((failures++))
+	fi
+
+	# Restore original red implementation
+	eval "$saved_red"
 
 	return $failures
 }
