@@ -98,11 +98,18 @@ trap 'err_report ${LINENO} "$BASH_COMMAND" $?' ERR
 
 VERSION="0.1.0"
 
+# Central default exclusions (kept in one place to avoid drift)
+DEFAULT_EXCLUDES="/tmp /proc /dev /sys /private .git node_modules __pycache__ .DS_Store"
+
+# Failure logging
+FAIL_LOG=""
+FAIL_COUNT=0
+
 # Default timestamp format if not specified in env
 : "${TIMESTAMP:=%Y%m%d%H%M%S}"
 
 # Default exclusions if not overridden
-: "${EXCLUDES:=/proc /dev /sys /private /Volumes tmp .git node_modules __pycache__ .DS_Store}"
+: "${EXCLUDES:=$DEFAULT_EXCLUDES}"
 
 # Process path string, replacing timestamp placeholders with actual values
 process_path() {
@@ -204,19 +211,31 @@ diff_metadata() {
 copy_metadata() {
 	local source="$1"
 	local target="$2"
+	local cmd
 
 	debug "Copying metadata from $source to $target"
 
 	# Copy basic permissions
-	$CHMOD_CMD --reference="$source" "$target" || error "Failed to copy permissions for $target"
+	cmd="$CHMOD_CMD --reference=\"$source\" \"$target\""
+	if ! $CHMOD_CMD --reference="$source" "$target"; then
+		record_failure "$cmd" "copy permissions"
+	fi
 
 	# Copy ownership if root
 	if is_root; then
-		$CHOWN_CMD --reference="$source" "$target" || error "Failed to copy ownership for $target"
+		cmd="$CHOWN_CMD --reference=\"$source\" \"$target\""
+		if ! $CHOWN_CMD --reference="$source" "$target"; then
+			record_failure "$cmd" "copy ownership"
+		fi
 	fi
 
 	# Copy timestamps
-	$TOUCH_CMD --reference="$source" "$target" || error "Failed to copy timestamps for $target"
+	cmd="$TOUCH_CMD --reference=\"$source\" \"$target\""
+	if ! $TOUCH_CMD --reference="$source" "$target"; then
+		record_failure "$cmd" "copy timestamps"
+	fi
+
+	return 0
 }
 
 # Create metadata backup
@@ -224,7 +243,7 @@ backup_metadata() {
 	local source_dir="$1"
 	local target_dir="$2"
 	local exclude_patterns=()
-	local excludes="${EXCLUDES:-/tmp /proc /dev /sys .git node_modules __pycache__ .DS_Store}"  # Use default if unset
+	local excludes="${EXCLUDES:-$DEFAULT_EXCLUDES}"  # Use default if unset
 
 	[ ! -d "$source_dir" ] && error "Source directory does not exist: $source_dir" && return 1
 
@@ -240,12 +259,21 @@ backup_metadata() {
 	# Build exclude patterns from space-separated EXCLUDES
 	debug "Building exclude patterns from: $excludes"
 	for excl in $excludes; do
-		# Handle paths starting with ./ from find and regular files
 		debug "Processing exclude pattern: '$excl'"
-		exclude_patterns+=(
-			-not -path "*$excl*"
-			-not -name "$excl"
-		)
+		if [[ "$excl" == /* ]]; then
+			# Absolute path exclusion
+			exclude_patterns+=(
+				-not -path "$excl"
+				-not -path "$excl/*"
+			)
+		else
+			# Match on path components to avoid excluding substrings
+			exclude_patterns+=(
+				-not -path "*/$excl"
+				-not -path "*/$excl/*"
+				-not -name "$excl"
+			)
+		fi
 	done
 
 	# Debug: show final find command
@@ -326,6 +354,11 @@ backup_metadata() {
 		printf "\rProgress: 100%% (%d/%d)\n" "$total_items" "$total_items" >&2
 	fi
 
+	if [ $FAIL_COUNT -gt 0 ]; then
+		note "Metadata backup completed with $FAIL_COUNT failures. See $FAIL_LOG for rerunnable commands."
+		return 1
+	fi
+
 	debug "Metadata backup created at: $target_dir"
 	return 0
 }
@@ -359,13 +392,21 @@ restore_metadata() {
 		fi
 
 		# Copy metadata only if target exists
-		$CHMOD_CMD --reference="$backup_item" "$target_item" || error "Failed to copy permissions for $rel_path"
-		$TOUCH_CMD -r "$backup_item" "$target_item" || error "Failed to copy timestamps for $rel_path"
+		cmd="$CHMOD_CMD --reference=\"$backup_item\" \"$target_item\""
+		$CHMOD_CMD --reference="$backup_item" "$target_item" || record_failure "$cmd" "copy permissions for $rel_path"
+		cmd="$TOUCH_CMD -r \"$backup_item\" \"$target_item\""
+		$TOUCH_CMD -r "$backup_item" "$target_item" || record_failure "$cmd" "copy timestamps for $rel_path"
 
 		if is_root; then
-			$CHOWN_CMD --reference="$backup_item" "$target_item" || error "Failed to copy ownership for $rel_path"
+			cmd="$CHOWN_CMD --reference=\"$backup_item\" \"$target_item\""
+			$CHOWN_CMD --reference="$backup_item" "$target_item" || record_failure "$cmd" "copy ownership for $rel_path"
 		fi
 	done
+
+	if [ $FAIL_COUNT -gt 0 ]; then
+		note "Metadata restore completed with $FAIL_COUNT failures. See $FAIL_LOG for rerunnable commands."
+		return 1
+	fi
 
 	debug "Metadata restored to: $target_dir"
 }
@@ -419,320 +460,46 @@ setup_commands() {
 	fi
 }
 
-# Run individual tests and capture their return values without exiting on failure
+# Record a failed metadata operation and keep a rerunnable log
+record_failure() {
+	local command_str="$1"
+	local reason="$2"
+
+	((FAIL_COUNT++)) || true
+
+	if [ -z "$FAIL_LOG" ]; then
+		FAIL_LOG=$(mktemp /tmp/metadata_failures.XXXXXX)
+	fi
+
+	printf '%s\n' "$command_str  # $reason" >> "$FAIL_LOG"
+	if [[ -z "${QUIET_FAILURES:-}" ]]; then
+		red "Failed: $reason (${FAIL_COUNT} so far)"
+	fi
+}
+
+# Locate and execute the external test suite
 run_tests() {
-	local test_fails=0
-	local ret=0
+	local test_file="$(cd -- "$(dirname "$0")" && pwd)/metadata_tests.sh"
 
-	if ! is_root; then
-		note "Running without root privileges - skipping special permission tests"
-	fi
-
-	# Mute progress output during tests except for progress_indication test
-	export MUTE_PROGRESS=1
-
-	# Test utilities
-	export TEST_DIR=$(mktemp -d)
-	export BACKUP_DIR=$(mktemp -d)
-	export RESTORE_DIR=$(mktemp -d)
-
-	# Create test directories
-	debug "Creating test directories..."
-	mkdir -p "$TEST_DIR/dir1/subdir1/subdir2"
-
-	# Create test files
-	debug "Creating test files..."
-	$TOUCH_CMD "$TEST_DIR/dir1/file1"
-	$TOUCH_CMD "$TEST_DIR/dir1/file2"
-	$TOUCH_CMD "$TEST_DIR/dir1/subdir1/subdir2/file3"
-
-	# Create a test symlink
-	debug "Creating test symlink..."
-	ln -s "$TEST_DIR/dir1/file1" "$TEST_DIR/dir1/symlink1"
-
-	# Set up test permissions and timestamps
-	debug "Setting up test permissions and timestamps..."
-	$CHMOD_CMD 600 "$TEST_DIR/dir1/file1"
-	$CHMOD_CMD 755 "$TEST_DIR/dir1/file2"
-	$CHMOD_CMD 644 "$TEST_DIR/dir1/subdir1/subdir2/file3"
-	$TOUCH_CMD -t 202001010000 "$TEST_DIR/dir1/file1"
-	$TOUCH_CMD -t 202002020000 "$TEST_DIR/dir1/file2"
-	$TOUCH_CMD -t 202003030000 "$TEST_DIR/dir1/subdir1/subdir2/file3"
-
-	(
-		test_backup_metadata || ret=$?
-		((test_fails+=ret)) || true
-
-		test_restore_metadata || ret=$?
-		((test_fails+=ret)) || true
-
-		test_diff_metadata || ret=$?
-		((test_fails+=ret)) || true
-
-		test_excludes || ret=$?
-		((test_fails+=ret)) || true
-
-		test_error_handler || ret=$?
-		((test_fails+=ret)) || true
-
-		test_progress_indication || ret=$?
-		((test_fails+=ret)) || true
-
-		if [ $test_fails -eq 0 ]; then
-			green "All tests passed!"
-		else
-			red "$test_fails tests failed!"
-		fi
-		return $test_fails
-	) 2>&1 | grep -v "Not running as root"
-
-	local test_status=${PIPESTATUS[0]}
-
-	# Clean up
-	rm -rf "$TEST_DIR" "$BACKUP_DIR" "$RESTORE_DIR"
-	unset TEST_DIR BACKUP_DIR RESTORE_DIR
-
-	return $test_status
-}
-
-test_backup_metadata() {
-	debug "Testing backup creation..."
-
-	# Create backup
-	backup_metadata "$TEST_DIR" "$BACKUP_DIR"
-
-	# Verify backup structure
-	local failures=0
-
-	# Check if files exist
-	for file in "dir1/file1" "dir1/file2" "dir1/subdir1/subdir2/file3"; do
-		if [ ! -e "$BACKUP_DIR/$file" ]; then
-			error "$(basename "$file") not created in backup"
-			((failures++)) || true
-		fi
-	done
-
-	# Test that backup was created
-	[ ! -d "$BACKUP_DIR" ] && error "Backup directory not created" && return 1
-
-	# Test that symlinks are ignored
-	[ -L "$BACKUP_DIR/dir1/symlink1" ] && error "Symlink was copied but should have been ignored" && return 1
-
-	# Test file permissions
-	[ "$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/file1")" = "600" ] || { error "'600' != '$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/file1")'"; ((failures++)) || true; }
-	[ "$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/file2")" = "755" ] || { error "'755' != '$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/file2")'"; ((failures++)) || true; }
-	[ "$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/subdir1/subdir2/file3")" = "644" ] || { error "'644' != '$($STAT_CMD --format=%a "$BACKUP_DIR/dir1/subdir1/subdir2/file3")'"; ((failures++)) || true; }
-
-	if [ "$failures" -eq 0 ]; then
-		debug "Backup creation test passed"
-	else
-		error "Backup creation test failed with $failures errors"
-	fi
-	return $failures
-}
-
-test_restore_metadata() {
-	debug "Testing metadata restoration..."
-	local ret=0
-
-	# Create backup
-	backup_metadata "$TEST_DIR" "$BACKUP_DIR"
-
-	# Create target directory with same structure but different metadata
-	debug "Creating restore test directories..."
-	mkdir -p "$RESTORE_DIR/dir1/subdir1/subdir2"
-
-	debug "Creating restore test files..."
-	$TOUCH_CMD "$RESTORE_DIR/dir1/file1"
-	$TOUCH_CMD "$RESTORE_DIR/dir1/file2"
-	$TOUCH_CMD "$RESTORE_DIR/dir1/subdir1/subdir2/file3"
-
-	debug "Setting up restore test permissions..."
-	$CHMOD_CMD 777 "$RESTORE_DIR/dir1/file1"  # Different from original 600
-	$CHMOD_CMD 644 "$RESTORE_DIR/dir1/file2"  # Different from original 755
-
-	# Restore metadata
-	restore_metadata "$BACKUP_DIR" "$RESTORE_DIR"
-
-	# Compare metadata
-	diff_metadata "$TEST_DIR" "$RESTORE_DIR" || ret=$?
-
-	if [ $ret -eq 0 ]; then
-		debug "Restore test passed"
-	else
-		error "Restore test failed"
-	fi
-	return $ret
-}
-
-test_diff_metadata() {
-	debug "Testing metadata diff..."
-	local failures=0
-	local ret=0
-
-	# First test: identical directories should report no differences
-	backup_metadata "$TEST_DIR" "$BACKUP_DIR" || { error "Failed to create backup for test setup in test_diff_metadata"; ((ret++)) || true; }
-	diff_metadata "$TEST_DIR" "$BACKUP_DIR" || ret=$?
-	if [ $ret -ne 0 ]; then
-		error "Initial diff reported differences when there should be none"
-		((failures++)) || true
-	fi
-
-	# Second test: different permissions should be detected
-	$CHMOD_CMD 777 "$BACKUP_DIR"/dir1/file1
-	diff_metadata "$TEST_DIR" "$BACKUP_DIR" > /dev/null || ret=$?
-	if [ $ret -eq 0 ]; then
-		error "Diff did not detect permission changes"
-		((failures++)) || true
-	fi
-
-	if [ "$failures" -eq 0 ]; then
-		debug "Diff test passed"
-	else
-		error "Diff test failed with $failures errors"
-	fi
-	return $failures
-}
-
-test_excludes() {
-	local failures=0
-	debug "Testing exclusion functionality..."
-
-	# Create test structure with excludable content
-	mkdir -p "$TEST_DIR"/{src,node_modules,target}
-	$TOUCH_CMD "$TEST_DIR"/{src/main.rs,node_modules/foo,target/debug}
-
-	# Test with custom excludes
-	EXCLUDES="target node_modules" backup_metadata "$TEST_DIR" "$BACKUP_DIR"
-
-	# Verify only src dir was backed up
-	if [ -e "$BACKUP_DIR/node_modules" ]; then
-		error "node_modules was not excluded"
-		((failures++)) || true
-	fi
-
-	if [ -e "$BACKUP_DIR/target" ]; then
-		error "target was not excluded"
-		((failures++)) || true
-	fi
-
-	if [ ! -e "$BACKUP_DIR/src/main.rs" ]; then
-		error "src/main.rs was incorrectly excluded"
-		((failures++)) || true
-	fi
-
-	# Test with default excludes
-	rm -rf "$BACKUP_DIR"
-	mkdir -p "$TEST_DIR"/.git
-	$TOUCH_CMD "$TEST_DIR"/.git/config
-	unset EXCLUDES  # Ensure we use defaults
-	backup_metadata "$TEST_DIR" "$BACKUP_DIR"
-
-	if [ -e "$BACKUP_DIR/.git" ]; then
-		error "Default exclude (.git) was not honored"
-		((failures++)) || true
-	fi
-
-	if [ "$failures" -eq 0 ]; then
-		debug "Exclusion test passed"
-	else
-		error "Exclusion test failed with $failures errors"
-	fi
-	return $failures
-}
-
-test_error_handler() {
-	debug "Testing error handler..."
-
-	# Create a temp file for error output
-	local error_output=$(mktemp)
-
-	# Run this script with a command we know will fail
-	# We use process substitution to capture stderr while allowing stdout through
-	if DEBUG=1 $0 error_test 2> "$error_output"; then
-		error "Error handler test failed - command succeeded when it should have failed"
-		rm "$error_output"
+	if [ ! -f "$test_file" ]; then
+		error "Test file not found: $test_file"
 		return 1
 	fi
 
-	# Check that error output contains expected elements
-	local expected_patterns=(
-		"Error in.*at.*metadata.*exit code:"
-		"Command that failed:"
-		"Call trace:"
-		"[[:space:]]*->.*at.*metadata:"
-	)
+	# shellcheck source=/dev/null
+	source "$test_file"
 
-	local failed=0
-	for pattern in "${expected_patterns[@]}"; do
-		if ! grep -E "$pattern" "$error_output" >/dev/null; then
-			error "Error handler test failed - missing expected pattern: $pattern"
-			error "Error output was:"
-			cat "$error_output" >&2
-			failed=1
-		fi
-	done
-
-	rm "$error_output"
-
-	if [ "$failed" -eq 0 ]; then
-		debug "Error handler test passed"
+	if ! declare -f metadata_run_tests >/dev/null 2>&1; then
+		error "metadata_run_tests not defined in $test_file"
+		return 1
 	fi
 
-	return $failed
+	metadata_run_tests
 }
 
-test_progress_indication() {
-	debug "Testing progress indication..."
-	local failures=0
-	local progress_output=$(mktemp)
-
-	# Ensure progress output is not muted for this specific test
-	local old_mute_progress="${MUTE_PROGRESS:-}"
-	unset MUTE_PROGRESS
-
-	# Create exactly two test files
-	mkdir -p "$TEST_DIR/progress_test"
-	$TOUCH_CMD "$TEST_DIR/progress_test/file1"
-	$TOUCH_CMD "$TEST_DIR/progress_test/file2"
-
-	# Capture ALL output from backup
-	UPDATE_INTERVAL=1 backup_metadata "$TEST_DIR/progress_test" "$BACKUP_DIR" > "$progress_output" 2>&1
-
-	# Check for 33% progress message after first file
-	if ! grep -q "Progress: 33% (1/3)" "$progress_output"; then
-		error "Expected 33% progress message not found"
-		debug "Actual output:"
-		cat "$progress_output" >&2
-		((failures++))
-	fi
-
-	# Check for 100% progress message at end
-	if ! grep -q "Progress: 100% (3/3)" "$progress_output"; then
-		error "Expected 100% progress message not found"
-		debug "Actual output:"
-		cat "$progress_output" >&2
-		((failures++))
-	fi
-
-	rm -f "$progress_output"
-
-	MUTE_PROGRESS="$old_mute_progress"
-
-	if [ "$failures" -eq 0 ]; then
-		debug "Progress indication test passed"
-	else
-		error "Progress indication test failed with $failures errors"
-	fi
-
-	return $failures
-}
-
-# Special command just for testing the error handler
+# Special command just for testing the error handler (referenced in tests)
 error_test() {
-	# This will definitely fail and trigger the handler
 	ls nonexistent_directory_that_should_not_exist_anywhere_really_seriously
-	# The line above should fail before we get here
 	error "Error handler test failed - command succeeded when it should have failed"
 	return 1
 }
@@ -845,19 +612,22 @@ main() {
 			[ $# -gt 2 ] && { usage "too many arguments for backup command"; exit 1; }
 			local source_dir="$1"
 			# If no target dir specified, use default with timestamp
-			local target_dir="${2:-${source_dir%/}.metadata_$(date +"$TIMESTAMP")}"
+			local target_dir="${2:-${source_dir%/}.metadata_$($DATE_CMD +"$TIMESTAMP")}" 
 			backup_metadata "$source_dir" "$target_dir" || exit $?
 			;;
 		restore)
 			[ $# -eq 2 ] || { usage "restore requires backup and target directories"; exit 1; }
 			restore_metadata "$1" "$2" || exit $?
 			;;
-		diff)
+			diff)
 			[ $# -eq 2 ] || { usage "diff requires two directories to compare"; exit 1; }
 			diff_metadata "$1" "$2" || exit $?
 			;;
-		test)
+		test|--test)
 			run_tests || exit $?
+			;;
+		-a|--about)
+			echo "metadata-backup: backup, diff, and restore file metadata (permissions, ownership, timestamps) via empty-file mirrors"
 			;;
 		error_test)
 			# Special case for testing error handler
