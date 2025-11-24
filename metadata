@@ -617,12 +617,15 @@ main() {
 			[ $# -eq 2 ] || { usage "restore requires backup and target directories"; exit 1; }
 			restore_metadata "$1" "$2" || exit $?
 			;;
-		diff)
+			diff)
 			[ $# -eq 2 ] || { usage "diff requires two directories to compare"; exit 1; }
 			diff_metadata "$1" "$2" || exit $?
 			;;
-		test)
+		test|--test)
 			run_tests || exit $?
+			;;
+		-a|--about)
+			echo "metadata-backup: backup, diff, and restore file metadata (permissions, ownership, timestamps) via empty-file mirrors"
 			;;
 		error_test)
 			# Special case for testing error handler

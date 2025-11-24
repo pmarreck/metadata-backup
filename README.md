@@ -38,6 +38,8 @@ metadata [OPTIONS] COMMAND [ARGS]
 
 - `-h, --help` - Show help message and exit
 - `-v, --version` - Show version information and exit
+- `-a, --about` - One-line description of the tool
+- `--test` - Run the test suite (same as `test` command)
 
 ### Commands
 
